@@ -1,0 +1,37 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+!.vscode/settings.json
+!.vscode/launch.json
+.idea/
+*.swp
+*.swo
+
+# Outputs & logs (keep structure, ignore content)
+output/runs/*
+output/logs/*
+!output/.gitkeep
+
+# Environment secrets
+.env
+*.env.local
+*.pem
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CrewAI cache
+.cache/
+crewai_cache/

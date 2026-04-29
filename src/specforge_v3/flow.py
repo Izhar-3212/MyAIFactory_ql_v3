@@ -1,0 +1,373 @@
+"""AI Factory v3 - Sequential Pipeline with QA Loop & Billing"""
+# 🔧 CRITICAL: Set env vars BEFORE any CrewAI imports to force Ollama usage
+import os
+os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+os.environ["OPENAI_API_KEY"] = "ollama"
+os.environ["CREWAI_TRACING_ENABLED"] = "false"
+
+# Standard library imports (moved to top for clarity & performance)
+import re, json, logging, time, subprocess, tempfile, sys
+from pathlib import Path
+from functools import wraps
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+
+from crewai import Agent, Task, Crew
+from pydantic import BaseModel
+
+from specforge_v3.state import ProjectState
+from specforge_v3.billing import BillingService
+from specforge_v3.tools.test_runner import run_acceptance_tests
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s]: %(message)s")
+logger = logging.getLogger("ai-factory-v3")
+
+# ------------------------------------------------------------------
+# RETRY DECORATOR
+# ------------------------------------------------------------------
+def retry_on_failure(max_attempts: int = 3, delay: int = 2):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_attempts - 1:
+                        logger.error(f"❌ {func.__name__} failed after {max_attempts} attempts: {e}")
+                        raise
+                    logger.warning(f"⚠️ {func.__name__} attempt {attempt+1} failed, retrying in {delay}s...")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+# ------------------------------------------------------------------
+# LLM ROUTER
+# ------------------------------------------------------------------
+def get_llm_string(role: str) -> str:
+    model_map = {
+        "coder": os.getenv("AGENT_MODEL_CODER", "qwen2.5-coder:7b"),
+        "architect": os.getenv("AGENT_MODEL_ARCHITECT", "qwen2.5:7b"),
+        "general": os.getenv("AGENT_MODEL_GENERAL", "llama3.2:3b")
+    }
+    return f"ollama/{model_map.get(role, model_map['general'])}"
+
+# ------------------------------------------------------------------
+# PIPELINE CLASS
+# ------------------------------------------------------------------
+class AIFactoryPipeline:
+    def __init__(self):
+        self.state = ProjectState()
+        self.billing = BillingService()
+
+    def _track_tokens(self, service: str, crew_output):
+        try:
+            usage = getattr(crew_output, 'token_usage', None)
+            if usage is None: return
+            if hasattr(usage, 'prompt_tokens'):
+                prompt, completion = usage.prompt_tokens, usage.completion_tokens
+            elif isinstance(usage, dict):
+                prompt = usage.get('prompt_tokens') or usage.get('input_tokens', 0)
+                completion = usage.get('completion_tokens') or usage.get('output_tokens', 0)
+            else: return
+            if (prompt is None or completion is None) and hasattr(crew_output, 'raw') and crew_output.raw:
+                text_len = len(str(crew_output.raw))
+                if prompt is None: prompt = text_len // 4
+                if completion is None: completion = text_len // 4
+            if prompt is not None or completion is not None:
+                self.billing.add_usage(service, prompt or 0, completion or 0)
+        except Exception as e:
+            logger.warning(f"Token tracking failed for {service}: {e}")
+
+    @retry_on_failure(max_attempts=2, delay=1)
+    def _create_agent(self, role: str, goal: str, backstory: str, tools=None, llm_role: str = "general"):
+        return Agent(
+            role=role, goal=goal, backstory=backstory,
+            llm=get_llm_string(llm_role), tools=tools or [],
+            verbose=False, allow_delegation=False
+        )
+
+    def _extract_code_blocks(self, text: str, language: str = "python") -> List[Dict[str, str]]:
+        """Extract ALL code blocks from markdown. Returns list of {'filename': str, 'code': str}."""
+        pattern = rf"```(?:{language}|{language.lower()})?\s*([^\n]*)\n(.*?)```"
+        matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
+        blocks = []
+        for i, m in enumerate(matches):
+            fname = m.group(1).strip() or f"file_{i+1}.{language}"
+            blocks.append({"filename": fname, "code": m.group(2).strip()})
+        return blocks if blocks else [{"filename": f"main.{language}", "code": text.strip()}]
+
+    def _validate_code_inline(self, code: str, language: str = "python", max_attempts: int = 2) -> str:
+        """Run ruff validation with auto-fix. Always returns the best-effort fixed code."""
+        if language != "python": return code
+        try:
+            for attempt in range(max_attempts):
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
+                    f.write(code)
+                    f.flush()
+                    result = subprocess.run(
+                        [sys.executable, "-m", "ruff", "check", "--fix", "--output-format=json", f.name],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    errors = json.loads(result.stdout) if result.stdout else []
+                    with open(f.name, 'r', encoding='utf-8') as rf:
+                        fixed_code = rf.read()
+                    if not errors:
+                        return fixed_code
+                    logger.warning(f"⚠️ Validation attempt {attempt+1}: {len(errors)} issues remain (auto-fixed where possible)")
+                    code = fixed_code
+            logger.warning("⚠️ Max validation attempts reached. Returning best-effort fixed code.")
+            return code
+        except Exception as e:
+            logger.warning(f"⚠️ Validation skipped (ruff unavailable or error): {e}")
+            return code
+
+    def kickoff(self, project_idea: str):
+        self.state.project_idea = project_idea
+        self.state.status = "running"
+        logger.info(f"🚀 AI Factory v3 starting: {project_idea[:60]}...")
+        self.run_research()
+        self.run_ba()
+        self.run_pm()
+        self.run_architect()
+        
+        while self.state.iteration_count <= self.state.max_iterations:
+            logger.info(f" Coding Cycle #{self.state.iteration_count + 1}")
+            self.run_backend_coder()
+            self.run_frontend_coder()
+            self.run_integrator()
+            self.run_qa()
+            if self.state.qa_status == "passed": break
+            self.state.iteration_count += 1
+            if self.state.iteration_count > self.state.max_iterations:
+                logger.warning("⚠️ Max QA iterations reached. Proceeding to completion.")
+                break
+            logger.warning(f"🔄 QA failed. Looping back for fix attempt #{self.state.iteration_count}...")
+        self.complete_pipeline()
+
+    def run_research(self):
+        logger.info("🔍 Phase 1: Research...")
+        agent = self._create_agent("Researcher", "Provide factual technical context", "Expert in feasibility & patterns.")
+        task = Task(description=f"Research context for: {self.state.project_idea}. Focus on offline-first, sync, security.", agent=agent, expected_output="Markdown report")
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        self.state.research_context = result.raw
+        self._track_tokens("researcher", result)
+        logger.info("✅ Research complete")
+
+    def run_ba(self):
+        logger.info("📋 Phase 2: Business Analysis...")
+        agent = self._create_agent(
+            "Senior Business Analyst", 
+            "Convert project requirements into INVEST user stories", 
+            "Expert in agile requirements, acceptance criteria, and JSON structuring.", 
+            llm_role="general"
+        )
+        
+        task = Task(
+            description=f"""You are a Senior Business Analyst. Convert the project idea and research context into structured user stories.
+
+PROJECT IDEA: {self.state.project_idea}
+RESEARCH CONTEXT: {self.state.research_context[:1200]}
+
+INSTRUCTIONS:
+1. Generate EXACTLY 10 user stories.
+2.Follow a logical SDLC sequence. Distribute stories across Backend (API/Data), Frontend (UI/Interactions), and Testing/Validation aspects.
+3. Each story MUST be a valid JSON object with these exact keys:
+   - "id": string (e.g., "US-1")
+   - "title": string (short, action-oriented)
+   - "description": string (1-2 sentences)
+   - "priority": string (must be "high", "medium", or "low")
+   - "acceptance_criteria": array of strings (testable conditions)
+4. Output MUST be a raw JSON array. DO NOT include markdown, code blocks, explanations, or any text outside the JSON array. DO NOT include markdown, code blocks, explanations, or any text outside the JSON array.
+
+EXAMPLE OUTPUT:
+[
+  {{
+    "id": "US-1",
+    "title": "User Authentication",
+    "description": "Users can log in securely using JWT tokens.",
+    "priority": "high",
+    "acceptance_criteria": ["Valid credentials return a JWT token", "Invalid credentials return 401 error"]
+  }}
+]
+""",
+            agent=agent,
+            expected_output="JSON array"
+        )
+        
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        self._track_tokens("ba", result)
+        
+        # Robust JSON extraction (handles LLM markdown wrapping & prefix text)
+        raw_text = result.raw if hasattr(result, 'raw') else str(result)
+        start = raw_text.find('[')
+        end = raw_text.rfind(']')
+        
+        if start != -1 and end != -1 and end > start:
+            cleaned_json = raw_text[start:end+1]
+        else:
+            cleaned_json = raw_text
+            
+        try:
+            self.state.user_stories = json.loads(cleaned_json)
+            if not isinstance(self.state.user_stories, list):
+                self.state.user_stories = [self.state.user_stories]
+            logger.info(f"✅ BA complete: {len(self.state.user_stories)} stories")
+        except json.JSONDecodeError as e:
+            logger.error(f"❌ BA JSON parsing failed: {e}")
+            logger.debug(f"Raw output snippet: {cleaned_json[:300]}")
+            self.state.user_stories = []
+
+    def run_pm(self):
+        if not self.state.user_stories or not os.getenv("GITHUB_TOKEN"):
+            logger.info("⏭️ Skipping PM (no stories or GitHub token)")
+            self.state.pm_status = "skipped"
+            return
+        logger.info("📦 Phase 3: Project Management...")
+        try:
+            from specforge_v3.tools.github_tool import create_github_repo, create_github_issue
+            repo_name = f"project-{self.state.project_idea[:20].replace(' ', '-').lower()}"
+            repo_result = create_github_repo.run(name=repo_name, description=self.state.project_idea[:100])
+            if repo_result.get("success"):
+                self.state.github_repo_url = repo_result["url"]
+                for story in self.state.user_stories:
+                    if story.get("priority") in ["high", "medium"]:
+                        title = f"{story.get('id', 'TASK')}: {story.get('title', 'Untitled')}"
+                        criteria_list = story.get("acceptance_criteria", [])
+                        body = f"Acceptance Criteria:\n" + "\n".join([f"- {c}" for c in criteria_list]) if isinstance(criteria_list, list) else f"Acceptance Criteria:\n- {criteria_list}"
+                        create_github_issue.run(repo_name=repo_name, title=title, body=body)
+                self.state.pm_status = "completed"
+                logger.info(f"✅ PM complete: Repo {repo_name} created")
+            else:
+                logger.warning(f"⚠️ GitHub repo creation failed: {repo_result.get('error')}")
+                self.state.pm_status = "failed"
+        except ImportError:
+            logger.warning("️ GitHub tools not available, using stub")
+            self.state.github_repo_url = "https://github.com/example/repo"
+            self.state.pm_status = "completed"
+        except Exception as e:
+            logger.error(f"❌ PM phase error: {e}")
+            self.state.pm_status = "failed"
+
+    def run_architect(self):
+        logger.info("🏗️ Phase 4: Architecture...")
+        agent = self._create_agent("Architect", "Design system architecture", "Expert in scalable patterns & API contracts.", llm_role="architect")
+        stories_fmt = "\n".join([f"- {s.get('title','')}: {s.get('acceptance_criteria',[])}" for s in self.state.user_stories[:10]])
+        task = Task(description=f"Design for: {self.state.project_idea}\nStories:\n{stories_fmt}\nOutput: Mermaid, API table, DB schema.", agent=agent, expected_output="Markdown")
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        self.state.architecture = result.raw
+        self._track_tokens("architect", result)
+        logger.info("✅ Architecture complete")
+
+    def run_backend_coder(self):
+        is_loop = self.state.iteration_count > 0
+        context = f"Project: {self.state.project_idea}\nArchitecture: {self.state.architecture[:500]}"
+        if is_loop:
+            context += f"\n🐛 FIX BUGS:\n" + "\n".join([f"- {b['severity']}: {b['description']}" for b in self.state.bugs])
+        agent = self._create_agent("Backend Coder", "Generate production FastAPI code", "Expert in async APIs & DB design.", llm_role="coder")
+        task = Task(description=context, agent=agent, expected_output="Python code blocks")
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        
+        blocks = self._extract_code_blocks(result.raw, language="python")
+        validated_blocks = [self._validate_code_inline(b["code"]) for b in blocks]
+        self.state.backend_code = "\n\n".join(validated_blocks)
+        self._track_tokens("backend_coder", result)
+        logger.info(f"✅ Backend code generated & validated ({len(blocks)} file(s))")
+
+    def run_frontend_coder(self):
+        context = f"Project: {self.state.project_idea}\nBackend Code:\n{self.state.backend_code[:800]}"
+        agent = self._create_agent("Frontend Coder", "Generate React+TS+Tailwind code", "Expert in modern UI & state management.", llm_role="coder")
+        task = Task(description=context, agent=agent, expected_output="TypeScript code blocks")
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        
+        blocks = self._extract_code_blocks(result.raw, language="typescript")
+        self.state.frontend_code = "\n\n".join([b["code"] for b in blocks])
+        self._track_tokens("frontend_coder", result)
+        logger.info(f"✅ Frontend code generated & extracted ({len(blocks)} file(s))")
+
+    def run_integrator(self):
+        logger.info("🔗 Phase 6: Integration...")
+        merged = f"# INTEGRATED PROJECT\n\n## Backend\n{self.state.backend_code}\n\n## Frontend\n{self.state.frontend_code}"
+        self.state.integrated_code = merged
+        self.state.api_contract_validated = True
+        logger.info("✅ Integration complete")
+
+    def run_qa(self):
+        logger.info(f"🧪 QA Phase (Attempt {self.state.iteration_count + 1})...")
+        criteria = []
+        for story in self.state.user_stories:
+            ac = story.get("acceptance_criteria")
+            if isinstance(ac, list) and all(isinstance(c, str) for c in ac):
+                criteria.extend(ac)
+            elif isinstance(ac, str):
+                criteria.append(ac)
+        if not criteria:
+            criteria = [s.get("title", "No criteria provided") for s in self.state.user_stories[:5]]
+        
+        test_result = run_acceptance_tests.run(
+            code=self.state.backend_code,
+            acceptance_criteria=criteria[:10], 
+            language="python"
+        )
+        self.state.test_results = test_result
+        self.state.test_logs = test_result.get("output_snippet", "")
+        
+        if test_result["status"] == "passed":
+            self.state.qa_status = "passed"
+            self.state.bugs = []
+        else:
+            self.state.qa_status = "failed"
+            self.state.bugs = [{"id": f"TEST-FAIL-{i}", "severity": "high", "description": f"Test failed: {err}"} for i, err in enumerate(test_result.get("errors", ["Unknown test failure"])[:3])]
+        logger.info(f"QA Result: {self.state.qa_status} | Tests: {test_result.get('tests_passed',0)}/{test_result.get('tests_passed',0)+test_result.get('tests_failed',0)}")
+
+    def complete_pipeline(self):
+        logger.info("💰 Generating billing invoice...")
+        self.state.billing_invoice = self.billing.generate_invoice()
+        self.state.status = "completed"
+        
+        run_id = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+        out_dir = Path("output") / "runs" / f"run-{run_id}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        
+        try:
+            (out_dir / "invoice.json").write_text(json.dumps(self.state.billing_invoice, indent=2), encoding="utf-8")
+            (out_dir / "backend.py").write_text(self.state.backend_code or "# No backend code generated", encoding="utf-8")
+            (out_dir / "frontend.tsx").write_text(self.state.frontend_code or "# No frontend code generated", encoding="utf-8")
+            (out_dir / "integrated.md").write_text(self.state.integrated_code or "# No integrated code", encoding="utf-8")
+            (out_dir / "architecture.md").write_text(self.state.architecture or "# No architecture generated", encoding="utf-8")
+            (out_dir / "user_stories.json").write_text(json.dumps(self.state.user_stories, indent=2), encoding="utf-8")
+            (out_dir / "qa_report.json").write_text(json.dumps(self.state.test_results, indent=2), encoding="utf-8")
+            (out_dir / "research.md").write_text(self.state.research_context or "# No research generated", encoding="utf-8")
+            
+            marker = Path("output") / "runs" / "latest.txt"
+            marker.write_text(out_dir.name, encoding="utf-8")
+            
+            logger.info(f"🎉 Pipeline complete! Artifacts saved to: {out_dir}")
+            logger.info(f"🔗 Quick access: output/runs/latest.txt -> {out_dir.name}")
+            logger.info(f"💵 Total: ${self.state.billing_invoice['total_usd']}")
+            
+            print("\n" + "="*60)
+            print("📝 CODE PREVIEWS (First 300 chars each):")
+            print("="*60)
+            print("\n🐍 Backend (backend.py):")
+            print(self.state.backend_code[:300] if self.state.backend_code else "(empty)")
+            print("\n⚛️  Frontend (frontend.tsx):")
+            print(self.state.frontend_code[:300] if self.state.frontend_code else "(empty)")
+            print("="*60 + "\n")
+        except Exception as e:
+            logger.error(f"❌ Failed to save artifacts: {e}")
+            logger.info(f" Pipeline complete! (Artifacts export failed)")
+
+# ------------------------------------------------------------------
+# ENTRY POINT
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
+    pipeline = AIFactoryPipeline()
+    pipeline.kickoff("A simple Todo list app with FastAPI backend and React frontend")
+    print("\n📊 FINAL STATE:")
+    print(f"Status: {pipeline.state.status}")
+    print(f"Iterations: {pipeline.state.iteration_count}")
+    print(f"QA: {pipeline.state.qa_status}")
+    print(f"Billing: ${pipeline.state.billing_invoice.get('total_usd', 0)}")

@@ -1,0 +1,35 @@
+{
+  "timestamp": "2026-04-28T14:58:38.850125+00:00",
+  "breakdown": {
+    "base_fee": 0.5,
+    "prompt_tokens": 2580,
+    "prompt_cost": 0.0003,
+    "completion_tokens": 11271,
+    "completion_cost": 0.0023
+  },
+  "service_usage": {
+    "researcher": {
+      "prompt": 120,
+      "completion": 862
+    },
+    "ba": {
+      "prompt": 227,
+      "completion": 235
+    },
+    "architect": {
+      "prompt": 116,
+      "completion": 785
+    },
+    "backend_coder": {
+      "prompt": 1020,
+      "completion": 5993
+    },
+    "frontend_coder": {
+      "prompt": 1097,
+      "completion": 3396
+    }
+  },
+  "total_usd": 0.5025,
+  "invoice_id": "INV-20260428-145838",
+  "status": "generated"
+}
