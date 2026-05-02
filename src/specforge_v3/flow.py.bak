@@ -1,27 +1,23 @@
 """AI Factory v3 - Sequential Pipeline with QA Loop & Billing"""
+# 🔧 CRITICAL: Set env vars BEFORE any CrewAI imports to force Ollama usage
 import os
-import re
-import json
-import logging
-import time
-import subprocess
-import tempfile
-import sys
+os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
+os.environ["OPENAI_API_KEY"] = "ollama"
+os.environ["CREWAI_TRACING_ENABLED"] = "false"
+
+# Standard library imports (moved to top for clarity & performance)
+import re, json, logging, time, subprocess, tempfile, sys
 from pathlib import Path
 from functools import wraps
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 
-# Force Ollama before any CrewAI imports
-os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
-os.environ["OPENAI_API_KEY"] = "ollama"
-os.environ["CREWAI_TRACING_ENABLED"] = "false"
+from crewai import Agent, Task, Crew
+from pydantic import BaseModel
 
-from crewai import Agent, Task, Crew, LLM
 from specforge_v3.state import ProjectState
 from specforge_v3.billing import BillingService
 from specforge_v3.tools.test_runner import run_acceptance_tests
-from specforge_v3.tools.sanitizer import sanitize_generated_code
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s]: %(message)s")
 logger = logging.getLogger("ai-factory-v3")
@@ -48,14 +44,13 @@ def retry_on_failure(max_attempts: int = 3, delay: int = 2):
 # ------------------------------------------------------------------
 # LLM ROUTER
 # ------------------------------------------------------------------
-def get_model_name(role: str) -> str:
-    """Return the actual model name (without ollama/ prefix) from environment."""
+def get_llm_string(role: str) -> str:
     model_map = {
         "coder": os.getenv("AGENT_MODEL_CODER", "qwen2.5-coder:7b"),
         "architect": os.getenv("AGENT_MODEL_ARCHITECT", "qwen2.5:7b"),
         "general": os.getenv("AGENT_MODEL_GENERAL", "llama3.2:3b")
     }
-    return model_map.get(role, model_map["general"])
+    return f"ollama/{model_map.get(role, model_map['general'])}"
 
 # ------------------------------------------------------------------
 # PIPELINE CLASS
@@ -68,15 +63,13 @@ class AIFactoryPipeline:
     def _track_tokens(self, service: str, crew_output):
         try:
             usage = getattr(crew_output, 'token_usage', None)
-            if usage is None:
-                return
+            if usage is None: return
             if hasattr(usage, 'prompt_tokens'):
                 prompt, completion = usage.prompt_tokens, usage.completion_tokens
             elif isinstance(usage, dict):
                 prompt = usage.get('prompt_tokens') or usage.get('input_tokens', 0)
                 completion = usage.get('completion_tokens') or usage.get('output_tokens', 0)
-            else:
-                return
+            else: return
             if (prompt is None or completion is None) and hasattr(crew_output, 'raw') and crew_output.raw:
                 text_len = len(str(crew_output.raw))
                 if prompt is None: prompt = text_len // 4
@@ -88,23 +81,14 @@ class AIFactoryPipeline:
 
     @retry_on_failure(max_attempts=2, delay=1)
     def _create_agent(self, role: str, goal: str, backstory: str, tools=None, llm_role: str = "general"):
-        # Use explicit LLM object to force Ollama and avoid OpenAI fallback
-        model = get_model_name(llm_role)
-        llm = LLM(
-            model=model,
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",
-            temperature=0.3,
-            max_tokens=8192,
-            timeout=600,
-        )
         return Agent(
             role=role, goal=goal, backstory=backstory,
-            llm=llm, tools=tools or [],
+            llm=get_llm_string(llm_role), tools=tools or [],
             verbose=False, allow_delegation=False
         )
 
     def _extract_code_blocks(self, text: str, language: str = "python") -> List[Dict[str, str]]:
+        """Extract ALL code blocks from markdown. Returns list of {'filename': str, 'code': str}."""
         pattern = rf"```(?:{language}|{language.lower()})?\s*([^\n]*)\n(.*?)```"
         matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
         blocks = []
@@ -114,8 +98,8 @@ class AIFactoryPipeline:
         return blocks if blocks else [{"filename": f"main.{language}", "code": text.strip()}]
 
     def _validate_code_inline(self, code: str, language: str = "python", max_attempts: int = 2) -> str:
-        if language != "python":
-            return code
+        """Run ruff validation with auto-fix. Always returns the best-effort fixed code."""
+        if language != "python": return code
         try:
             for attempt in range(max_attempts):
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
@@ -148,13 +132,12 @@ class AIFactoryPipeline:
         self.run_architect()
         
         while self.state.iteration_count <= self.state.max_iterations:
-            logger.info(f"🔄 Coding Cycle #{self.state.iteration_count + 1}")
+            logger.info(f" Coding Cycle #{self.state.iteration_count + 1}")
             self.run_backend_coder()
             self.run_frontend_coder()
             self.run_integrator()
             self.run_qa()
-            if self.state.qa_status == "passed":
-                break
+            if self.state.qa_status == "passed": break
             self.state.iteration_count += 1
             if self.state.iteration_count > self.state.max_iterations:
                 logger.warning("⚠️ Max QA iterations reached. Proceeding to completion.")
@@ -166,8 +149,7 @@ class AIFactoryPipeline:
         logger.info("🔍 Phase 1: Research...")
         agent = self._create_agent("Researcher", "Provide factual technical context", "Expert in feasibility & patterns.")
         task = Task(description=f"Research context for: {self.state.project_idea}. Focus on offline-first, sync, security.", agent=agent, expected_output="Markdown report")
-        crew = Crew(agents=[agent], tasks=[task], verbose=False)
-        result = crew.kickoff()
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         self.state.research_context = result.raw
         self._track_tokens("researcher", result)
         logger.info("✅ Research complete")
@@ -175,25 +157,28 @@ class AIFactoryPipeline:
     def run_ba(self):
         logger.info("📋 Phase 2: Business Analysis...")
         agent = self._create_agent(
-            "Senior Business Analyst",
-            "Convert project requirements into INVEST user stories",
-            "Expert in agile requirements, acceptance criteria, and JSON structuring.",
+            "Senior Business Analyst", 
+            "Convert project requirements into INVEST user stories", 
+            "Expert in agile requirements, acceptance criteria, and JSON structuring.", 
             llm_role="general"
         )
-        ba_prompt = f"""You are a Senior Business Analyst. Convert the project idea and research context into structured user stories.
+        
+        task = Task(
+            description=f"""You are a Senior Business Analyst. Convert the project idea and research context into structured user stories.
 
 PROJECT IDEA: {self.state.project_idea}
 RESEARCH CONTEXT: {self.state.research_context[:1200]}
 
 INSTRUCTIONS:
-1. Generate EXACTLY 5 user stories.
-2. Each story MUST be a valid JSON object with these exact keys:
+1. Generate EXACTLY 10 user stories.
+2.Follow a logical SDLC sequence. Distribute stories across Backend (API/Data), Frontend (UI/Interactions), and Testing/Validation aspects.
+3. Each story MUST be a valid JSON object with these exact keys:
    - "id": string (e.g., "US-1")
    - "title": string (short, action-oriented)
    - "description": string (1-2 sentences)
    - "priority": string (must be "high", "medium", or "low")
    - "acceptance_criteria": array of strings (testable conditions)
-3. Output MUST be a raw JSON array. DO NOT include markdown, code blocks, explanations, or any text outside the JSON array.
+4. Output MUST be a raw JSON array. DO NOT include markdown, code blocks, explanations, or any text outside the JSON array. DO NOT include markdown, code blocks, explanations, or any text outside the JSON array.
 
 EXAMPLE OUTPUT:
 [
@@ -205,26 +190,32 @@ EXAMPLE OUTPUT:
     "acceptance_criteria": ["Valid credentials return a JWT token", "Invalid credentials return 401 error"]
   }}
 ]
-"""
-        task = Task(description=ba_prompt, agent=agent, expected_output="JSON array")
-        crew = Crew(agents=[agent], tasks=[task], verbose=False)
-        result = crew.kickoff()
+""",
+            agent=agent,
+            expected_output="JSON array"
+        )
+        
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         self._track_tokens("ba", result)
-        raw_text = result.raw
+        
+        # Robust JSON extraction (handles LLM markdown wrapping & prefix text)
+        raw_text = result.raw if hasattr(result, 'raw') else str(result)
         start = raw_text.find('[')
         end = raw_text.rfind(']')
+        
         if start != -1 and end != -1 and end > start:
             cleaned_json = raw_text[start:end+1]
         else:
             cleaned_json = raw_text
+            
         try:
-            user_stories = json.loads(cleaned_json)
-            if not isinstance(user_stories, list):
-                user_stories = [user_stories]
-            self.state.user_stories = user_stories
+            self.state.user_stories = json.loads(cleaned_json)
+            if not isinstance(self.state.user_stories, list):
+                self.state.user_stories = [self.state.user_stories]
             logger.info(f"✅ BA complete: {len(self.state.user_stories)} stories")
         except json.JSONDecodeError as e:
             logger.error(f"❌ BA JSON parsing failed: {e}")
+            logger.debug(f"Raw output snippet: {cleaned_json[:300]}")
             self.state.user_stories = []
 
     def run_pm(self):
@@ -243,10 +234,7 @@ EXAMPLE OUTPUT:
                     if story.get("priority") in ["high", "medium"]:
                         title = f"{story.get('id', 'TASK')}: {story.get('title', 'Untitled')}"
                         criteria_list = story.get("acceptance_criteria", [])
-                        if isinstance(criteria_list, list):
-                            body = "Acceptance Criteria:\n" + "\n".join([f"- {c}" for c in criteria_list])
-                        else:
-                            body = f"Acceptance Criteria:\n- {criteria_list}"
+                        body = f"Acceptance Criteria:\n" + "\n".join([f"- {c}" for c in criteria_list]) if isinstance(criteria_list, list) else f"Acceptance Criteria:\n- {criteria_list}"
                         create_github_issue.run(repo_name=repo_name, title=title, body=body)
                 self.state.pm_status = "completed"
                 logger.info(f"✅ PM complete: Repo {repo_name} created")
@@ -254,7 +242,7 @@ EXAMPLE OUTPUT:
                 logger.warning(f"⚠️ GitHub repo creation failed: {repo_result.get('error')}")
                 self.state.pm_status = "failed"
         except ImportError:
-            logger.warning("⚠️ GitHub tools not available, using stub")
+            logger.warning("️ GitHub tools not available, using stub")
             self.state.github_repo_url = "https://github.com/example/repo"
             self.state.pm_status = "completed"
         except Exception as e:
@@ -266,8 +254,7 @@ EXAMPLE OUTPUT:
         agent = self._create_agent("Architect", "Design system architecture", "Expert in scalable patterns & API contracts.", llm_role="architect")
         stories_fmt = "\n".join([f"- {s.get('title','')}: {s.get('acceptance_criteria',[])}" for s in self.state.user_stories[:10]])
         task = Task(description=f"Design for: {self.state.project_idea}\nStories:\n{stories_fmt}\nOutput: Mermaid, API table, DB schema.", agent=agent, expected_output="Markdown")
-        crew = Crew(agents=[agent], tasks=[task], verbose=False)
-        result = crew.kickoff()
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
         self.state.architecture = result.raw
         self._track_tokens("architect", result)
         logger.info("✅ Architecture complete")
@@ -276,17 +263,13 @@ EXAMPLE OUTPUT:
         is_loop = self.state.iteration_count > 0
         context = f"Project: {self.state.project_idea}\nArchitecture: {self.state.architecture[:500]}"
         if is_loop:
-            context += "\n🐛 FIX BUGS:\n" + "\n".join([f"- {b['severity']}: {b['description']}" for b in self.state.bugs])
+            context += f"\n🐛 FIX BUGS:\n" + "\n".join([f"- {b['severity']}: {b['description']}" for b in self.state.bugs])
         agent = self._create_agent("Backend Coder", "Generate production FastAPI code", "Expert in async APIs & DB design.", llm_role="coder")
         task = Task(description=context, agent=agent, expected_output="Python code blocks")
-        crew = Crew(agents=[agent], tasks=[task], verbose=False)
-        result = crew.kickoff()
-        raw_output = result.raw
-        blocks = self._extract_code_blocks(raw_output, language="python")
-        validated_blocks = []
-        for b in blocks:
-            sanitized = sanitize_generated_code(b["code"], lang="python")
-            validated_blocks.append(self._validate_code_inline(sanitized))
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        
+        blocks = self._extract_code_blocks(result.raw, language="python")
+        validated_blocks = [self._validate_code_inline(b["code"]) for b in blocks]
         self.state.backend_code = "\n\n".join(validated_blocks)
         self._track_tokens("backend_coder", result)
         logger.info(f"✅ Backend code generated & validated ({len(blocks)} file(s))")
@@ -295,14 +278,12 @@ EXAMPLE OUTPUT:
         context = f"Project: {self.state.project_idea}\nBackend Code:\n{self.state.backend_code[:800]}"
         agent = self._create_agent("Frontend Coder", "Generate React+TS+Tailwind code", "Expert in modern UI & state management.", llm_role="coder")
         task = Task(description=context, agent=agent, expected_output="TypeScript code blocks")
-        crew = Crew(agents=[agent], tasks=[task], verbose=False)
-        result = crew.kickoff()
-        raw_output = result.raw
-        blocks = self._extract_code_blocks(raw_output, language="typescript")
-        cleaned_blocks = [sanitize_generated_code(b["code"], lang="typescript") for b in blocks]
-        self.state.frontend_code = "\n\n".join(cleaned_blocks)
+        result = Crew(agents=[agent], tasks=[task], verbose=False).kickoff()
+        
+        blocks = self._extract_code_blocks(result.raw, language="typescript")
+        self.state.frontend_code = "\n\n".join([b["code"] for b in blocks])
         self._track_tokens("frontend_coder", result)
-        logger.info(f"✅ Frontend code generated & sanitized ({len(blocks)} file(s))")
+        logger.info(f"✅ Frontend code generated & extracted ({len(blocks)} file(s))")
 
     def run_integrator(self):
         logger.info("🔗 Phase 6: Integration...")
@@ -316,37 +297,38 @@ EXAMPLE OUTPUT:
         criteria = []
         for story in self.state.user_stories:
             ac = story.get("acceptance_criteria")
-            if isinstance(ac, list):
+            if isinstance(ac, list) and all(isinstance(c, str) for c in ac):
                 criteria.extend(ac)
             elif isinstance(ac, str):
                 criteria.append(ac)
         if not criteria:
             criteria = [s.get("title", "No criteria provided") for s in self.state.user_stories[:5]]
+        
         test_result = run_acceptance_tests.run(
             code=self.state.backend_code,
-            acceptance_criteria=criteria[:10],
+            acceptance_criteria=criteria[:10], 
             language="python"
         )
         self.state.test_results = test_result
         self.state.test_logs = test_result.get("output_snippet", "")
+        
         if test_result["status"] == "passed":
             self.state.qa_status = "passed"
             self.state.bugs = []
         else:
             self.state.qa_status = "failed"
-            self.state.bugs = [
-                {"id": f"TEST-FAIL-{i}", "severity": "high", "description": f"Test failed: {err}"}
-                for i, err in enumerate(test_result.get("errors", ["Unknown test failure"])[:3])
-            ]
+            self.state.bugs = [{"id": f"TEST-FAIL-{i}", "severity": "high", "description": f"Test failed: {err}"} for i, err in enumerate(test_result.get("errors", ["Unknown test failure"])[:3])]
         logger.info(f"QA Result: {self.state.qa_status} | Tests: {test_result.get('tests_passed',0)}/{test_result.get('tests_passed',0)+test_result.get('tests_failed',0)}")
 
     def complete_pipeline(self):
         logger.info("💰 Generating billing invoice...")
         self.state.billing_invoice = self.billing.generate_invoice()
         self.state.status = "completed"
+        
         run_id = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
         out_dir = Path("output") / "runs" / f"run-{run_id}"
         out_dir.mkdir(parents=True, exist_ok=True)
+        
         try:
             (out_dir / "invoice.json").write_text(json.dumps(self.state.billing_invoice, indent=2), encoding="utf-8")
             (out_dir / "backend.py").write_text(self.state.backend_code or "# No backend code generated", encoding="utf-8")
@@ -356,11 +338,14 @@ EXAMPLE OUTPUT:
             (out_dir / "user_stories.json").write_text(json.dumps(self.state.user_stories, indent=2), encoding="utf-8")
             (out_dir / "qa_report.json").write_text(json.dumps(self.state.test_results, indent=2), encoding="utf-8")
             (out_dir / "research.md").write_text(self.state.research_context or "# No research generated", encoding="utf-8")
+            
             marker = Path("output") / "runs" / "latest.txt"
             marker.write_text(out_dir.name, encoding="utf-8")
+            
             logger.info(f"🎉 Pipeline complete! Artifacts saved to: {out_dir}")
             logger.info(f"🔗 Quick access: output/runs/latest.txt -> {out_dir.name}")
             logger.info(f"💵 Total: ${self.state.billing_invoice['total_usd']}")
+            
             print("\n" + "="*60)
             print("📝 CODE PREVIEWS (First 300 chars each):")
             print("="*60)

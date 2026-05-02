@@ -17,7 +17,7 @@ os.environ["OPENAI_API_BASE"] = "http://localhost:11434/v1"
 os.environ["OPENAI_API_KEY"] = "ollama"
 os.environ["CREWAI_TRACING_ENABLED"] = "false"
 
-from crewai import Agent, Task, Crew, LLM
+from crewai import Agent, Task, Crew
 from specforge_v3.state import ProjectState
 from specforge_v3.billing import BillingService
 from specforge_v3.tools.test_runner import run_acceptance_tests
@@ -48,14 +48,13 @@ def retry_on_failure(max_attempts: int = 3, delay: int = 2):
 # ------------------------------------------------------------------
 # LLM ROUTER
 # ------------------------------------------------------------------
-def get_model_name(role: str) -> str:
-    """Return the actual model name (without ollama/ prefix) from environment."""
+def get_llm_string(role: str) -> str:
     model_map = {
         "coder": os.getenv("AGENT_MODEL_CODER", "qwen2.5-coder:7b"),
         "architect": os.getenv("AGENT_MODEL_ARCHITECT", "qwen2.5:7b"),
         "general": os.getenv("AGENT_MODEL_GENERAL", "llama3.2:3b")
     }
-    return model_map.get(role, model_map["general"])
+    return f"ollama/{model_map.get(role, model_map['general'])}"
 
 # ------------------------------------------------------------------
 # PIPELINE CLASS
@@ -88,19 +87,9 @@ class AIFactoryPipeline:
 
     @retry_on_failure(max_attempts=2, delay=1)
     def _create_agent(self, role: str, goal: str, backstory: str, tools=None, llm_role: str = "general"):
-        # Use explicit LLM object to force Ollama and avoid OpenAI fallback
-        model = get_model_name(llm_role)
-        llm = LLM(
-            model=model,
-            base_url="http://localhost:11434/v1",
-            api_key="ollama",
-            temperature=0.3,
-            max_tokens=8192,
-            timeout=600,
-        )
         return Agent(
             role=role, goal=goal, backstory=backstory,
-            llm=llm, tools=tools or [],
+            llm=get_llm_string(llm_role), tools=tools or [],
             verbose=False, allow_delegation=False
         )
 
@@ -148,7 +137,7 @@ class AIFactoryPipeline:
         self.run_architect()
         
         while self.state.iteration_count <= self.state.max_iterations:
-            logger.info(f"🔄 Coding Cycle #{self.state.iteration_count + 1}")
+            logger.info(f" Coding Cycle #{self.state.iteration_count + 1}")
             self.run_backend_coder()
             self.run_frontend_coder()
             self.run_integrator()
@@ -168,7 +157,7 @@ class AIFactoryPipeline:
         task = Task(description=f"Research context for: {self.state.project_idea}. Focus on offline-first, sync, security.", agent=agent, expected_output="Markdown report")
         crew = Crew(agents=[agent], tasks=[task], verbose=False)
         result = crew.kickoff()
-        self.state.research_context = result.raw
+        self.state.research_context = result.raw  # type: ignore
         self._track_tokens("researcher", result)
         logger.info("✅ Research complete")
 
@@ -210,7 +199,7 @@ EXAMPLE OUTPUT:
         crew = Crew(agents=[agent], tasks=[task], verbose=False)
         result = crew.kickoff()
         self._track_tokens("ba", result)
-        raw_text = result.raw
+        raw_text = result.raw  # type: ignore
         start = raw_text.find('[')
         end = raw_text.rfind(']')
         if start != -1 and end != -1 and end > start:
@@ -268,7 +257,7 @@ EXAMPLE OUTPUT:
         task = Task(description=f"Design for: {self.state.project_idea}\nStories:\n{stories_fmt}\nOutput: Mermaid, API table, DB schema.", agent=agent, expected_output="Markdown")
         crew = Crew(agents=[agent], tasks=[task], verbose=False)
         result = crew.kickoff()
-        self.state.architecture = result.raw
+        self.state.architecture = result.raw  # type: ignore
         self._track_tokens("architect", result)
         logger.info("✅ Architecture complete")
 
@@ -281,12 +270,9 @@ EXAMPLE OUTPUT:
         task = Task(description=context, agent=agent, expected_output="Python code blocks")
         crew = Crew(agents=[agent], tasks=[task], verbose=False)
         result = crew.kickoff()
-        raw_output = result.raw
+        raw_output = result.raw  # type: ignore
         blocks = self._extract_code_blocks(raw_output, language="python")
-        validated_blocks = []
-        for b in blocks:
-            sanitized = sanitize_generated_code(b["code"], lang="python")
-            validated_blocks.append(self._validate_code_inline(sanitized))
+                validated_blocks = [sanitize_generated_code(b['code'], language='python') for b in blocks]
         self.state.backend_code = "\n\n".join(validated_blocks)
         self._track_tokens("backend_coder", result)
         logger.info(f"✅ Backend code generated & validated ({len(blocks)} file(s))")
@@ -297,12 +283,11 @@ EXAMPLE OUTPUT:
         task = Task(description=context, agent=agent, expected_output="TypeScript code blocks")
         crew = Crew(agents=[agent], tasks=[task], verbose=False)
         result = crew.kickoff()
-        raw_output = result.raw
+        raw_output = result.raw  # type: ignore
         blocks = self._extract_code_blocks(raw_output, language="typescript")
-        cleaned_blocks = [sanitize_generated_code(b["code"], lang="typescript") for b in blocks]
-        self.state.frontend_code = "\n\n".join(cleaned_blocks)
+        self.state.frontend_code = "\n\n".join([b["code"] for b in blocks])
         self._track_tokens("frontend_coder", result)
-        logger.info(f"✅ Frontend code generated & sanitized ({len(blocks)} file(s))")
+        logger.info(f"✅ Frontend code generated & extracted ({len(blocks)} file(s))")
 
     def run_integrator(self):
         logger.info("🔗 Phase 6: Integration...")
